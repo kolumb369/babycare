@@ -1,0 +1,1450 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#ff6b9d">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Мама + Малюк</title>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=Quicksand:wght@600;700&display=swap" rel="stylesheet">
+
+<!-- ══ FIREBASE ══ -->
+<!-- ВАЖЛИВО: Замініть ці значення на свої з Firebase Console -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, getDoc, addDoc, updateDoc, deleteDoc, query, where, orderBy, onSnapshot, getDocs } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ══════════════════════════════════════
+// 🔥 ВСТАВТЕ СЮДИ СВІЙ FIREBASE CONFIG
+// Отримати на: console.firebase.google.com
+// ══════════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyAxVktnDowqSEEtkatCSObmhN78nT6Zc8g",
+  authDomain: "babycare-6a531.firebaseapp.com",
+  projectId: "babycare-6a531",
+  storageBucket: "babycare-6a531.firebasestorage.app",
+  messagingSenderId: "885700229000",
+  appId: "1:885700229000:web:aecaf1b3160b93c85f2c3d"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ══ GLOBAL STATE ══
+let currentUser = null;
+let unsubscribeEvents = null;
+let unsubSchedule = null;
+let events = [];
+let schedule = [];
+let childProfile = {};
+let isSleeping = false;
+let sleepStart = null;
+let sleepTimer = 0;
+let sleepInterval = null;
+let breastMs = {L:0,R:0};
+let breastActive = {L:false,R:false};
+let breastIntervals = {L:null,R:null};
+let breastStarts = {L:0,R:0};
+let mBreastRunning = false, mBreastStart=0, mBreastMs=0, mBreastInterval=null;
+let pastEventType = 'feed';
+let editingEventId = null;
+let editingScheduleId = null;
+let currentMonth = new Date().getMonth();
+let currentYear = new Date().getFullYear();
+let waterCount = 0;
+let feedInterval = 3;
+
+// ══ HELPERS ══
+function p2(n){return String(n).padStart(2,'0');}
+function nowHM(){const d=new Date();return p2(d.getHours())+':'+p2(d.getMinutes());}
+function fmtDur(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'г '+m+'хв':m+'хв';}
+function fmtTimer(ms){const s=Math.floor(ms/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?h+':'+p2(m)+':'+p2(sec):m+':'+p2(sec);}
+function todayStr(){const d=new Date();return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate());}
+
+let toastTmr;
+window.showToast = function(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastTmr);
+  toastTmr=setTimeout(()=>t.classList.remove('show'),2800);
+};
+
+window.openModal = function(id){document.getElementById(id).classList.add('open');};
+window.closeModal = function(id){document.getElementById(id).classList.remove('open');};
+
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('.modal-bg').forEach(m=>{
+    m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('open');});
+  });
+  initClock();
+});
+
+// ══ CLOCK ══
+function initClock(){
+  const u=()=>{const d=new Date(),el=document.getElementById('clock');if(el)el.textContent=p2(d.getHours())+':'+p2(d.getMinutes());};
+  u(); setInterval(u,1000);
+}
+
+// ══════════════════════════════════════
+// AUTH
+// ══════════════════════════════════════
+onAuthStateChanged(auth, user=>{
+  currentUser=user;
+  if(user){
+    document.getElementById('authScreen').style.display='none';
+    document.getElementById('appScreen').style.display='block';
+    loadUserProfile();
+    subscribeEvents();
+    subscribeSchedule();
+    showToast('👋 Вітаємо, '+( user.displayName||user.email)+'!');
+  } else {
+    document.getElementById('authScreen').style.display='flex';
+    document.getElementById('appScreen').style.display='none';
+    if(unsubscribeEvents){unsubscribeEvents();unsubscribeEvents=null;}
+    if(unsubSchedule){unsubSchedule();unsubSchedule=null;}
+  }
+});
+
+window.doRegister = async function(){
+  const name=document.getElementById('regName').value.trim();
+  const email=document.getElementById('regEmail').value.trim();
+  const pass=document.getElementById('regPass').value;
+  if(!name||!email||!pass){showAuthError('Заповніть всі поля');return;}
+  if(pass.length<6){showAuthError('Пароль мінімум 6 символів');return;}
+  try{
+    setAuthLoading(true);
+    const cred=await createUserWithEmailAndPassword(auth,email,pass);
+    await updateProfile(cred.user,{displayName:name});
+    showToast('✅ Акаунт створено!');
+  } catch(e){
+    showAuthError(authErrMsg(e.code));
+  } finally{setAuthLoading(false);}
+};
+
+window.doLogin = async function(){
+  const email=document.getElementById('loginEmail').value.trim();
+  const pass=document.getElementById('loginPass').value;
+  if(!email||!pass){showAuthError('Введіть email та пароль');return;}
+  try{
+    setAuthLoading(true);
+    await signInWithEmailAndPassword(auth,email,pass);
+  } catch(e){
+    showAuthError(authErrMsg(e.code));
+  } finally{setAuthLoading(false);}
+};
+
+window.doLogout = async function(){
+  if(!confirm('Вийти з акаунту?'))return;
+  await signOut(auth);
+  showToast('👋 До побачення!');
+};
+
+function showAuthError(msg){document.getElementById('authError').textContent=msg;}
+function setAuthLoading(on){document.getElementById('authSubmitBtn').disabled=on;document.getElementById('authSubmitBtn').textContent=on?'Зачекайте...':'Увійти / Зареєструватись';}
+function authErrMsg(code){
+  const m={'auth/email-already-in-use':'Email вже використовується','auth/user-not-found':'Користувача не знайдено','auth/wrong-password':'Невірний пароль','auth/invalid-email':'Невірний email','auth/too-many-requests':'Забагато спроб, спробуйте пізніше','auth/invalid-credential':'Невірний email або пароль'};
+  return m[code]||'Помилка: '+code;
+}
+
+window.switchAuthTab = function(tab){
+  document.getElementById('tabLogin').classList.toggle('on',tab==='login');
+  document.getElementById('tabReg').classList.toggle('on',tab==='reg');
+  document.getElementById('loginForm').style.display=tab==='login'?'block':'none';
+  document.getElementById('regForm').style.display=tab==='reg'?'block':'none';
+  document.getElementById('authError').textContent='';
+};
+
+// ══════════════════════════════════════
+// USER PROFILE
+// ══════════════════════════════════════
+async function loadUserProfile(){
+  if(!currentUser)return;
+  const ref=doc(db,'profiles',currentUser.uid);
+  const snap=await getDoc(ref);
+  if(snap.exists()){
+    childProfile=snap.data();
+    waterCount=childProfile.waterCount||0;
+    feedInterval=childProfile.feedInterval||3;
+  }
+  renderChildUI();
+  initWater();
+}
+
+async function saveProfile(data){
+  if(!currentUser)return;
+  await setDoc(doc(db,'profiles',currentUser.uid),{...childProfile,...data},{merge:true});
+  childProfile={...childProfile,...data};
+}
+
+window.saveSettings = async function(){
+  const name=document.getElementById('settingChildName').value.trim();
+  const birth=document.getElementById('settingBirthDate').value;
+  const avatar=window._selAvatar||childProfile.avatar||'🍼';
+  if(!name){showToast('⚠️ Введіть ім\'я дитини');return;}
+  await saveProfile({childName:name,birthDate:birth,avatar});
+  renderChildUI();
+  closeModal('settingsModal');
+  showToast('✅ Збережено!');
+};
+
+function renderChildUI(){
+  const name=childProfile.childName||'Ваш малюк';
+  const birth=childProfile.birthDate||'';
+  const avatar=childProfile.avatar||'🍼';
+  const el=n=>document.getElementById(n);
+  if(el('childNameDisplay'))el('childNameDisplay').textContent=name;
+  if(el('topChildName'))el('topChildName').textContent=name;
+  if(el('childAvatar'))el('childAvatar').textContent=avatar;
+  if(el('birthDisplay'))el('birthDisplay').textContent=birth?new Date(birth).toLocaleDateString('uk-UA',{day:'numeric',month:'long',year:'numeric'}):'—';
+  if(birth&&el('childAge')){
+    const diff=Math.floor((new Date()-new Date(birth))/86400000);
+    const mo=Math.floor(diff/30.44),dy=Math.round(diff-mo*30.44);
+    el('childAge').textContent=mo>0?mo+' міс. '+dy+' дн.':diff+' дн.';
+  }
+  // Pre-fill settings
+  if(el('settingChildName'))el('settingChildName').value=childProfile.childName||'';
+  if(el('settingBirthDate'))el('settingBirthDate').value=childProfile.birthDate||'';
+  if(el('userNameDisplay'))el('userNameDisplay').textContent=currentUser?.displayName||currentUser?.email||'';
+}
+
+window.selAvatar=function(a,btn){
+  window._selAvatar=a;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+
+// ══════════════════════════════════════
+// EVENTS — Firestore realtime
+// ══════════════════════════════════════
+function subscribeEvents(){
+  if(!currentUser)return;
+  const q=query(collection(db,'events'),where('uid','==',currentUser.uid),orderBy('ts','desc'));
+  unsubscribeEvents=onSnapshot(q,snap=>{
+    events=snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderAll();
+  });
+}
+
+async function addEvent(ev){
+  if(!currentUser)return;
+  const e={...ev,uid:currentUser.uid,ts:Date.now(),time:nowHM(),date:todayStr()};
+  await addDoc(collection(db,'events'),e);
+}
+
+async function updateEvent(id,data){
+  await updateDoc(doc(db,'events',id),data);
+}
+
+async function deleteEvent(id){
+  await deleteDoc(doc(db,'events',id));
+}
+
+// ══════════════════════════════════════
+// NAVIGATION
+// ══════════════════════════════════════
+window.goTo=function(name){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  document.getElementById('s-'+name).classList.add('active');
+  document.getElementById('nav-'+name).classList.add('active');
+  if(name==='schedule')renderCalendar();
+};
+
+// ══════════════════════════════════════
+// RENDER ALL
+// ══════════════════════════════════════
+function renderAll(){
+  renderTimeline();
+  renderStats();
+  renderFeedHistory();
+  renderSleepLog();
+  updateSleepUI();
+}
+
+// ══════════════════════════════════════
+// TIMELINE
+// ══════════════════════════════════════
+function renderTimeline(){
+  const el=document.getElementById('timeline');
+  if(!el)return;
+  const tod=todayStr();
+  const todayEv=events.filter(e=>e.date===tod);
+  if(!todayEv.length){
+    el.innerHTML='<div style="text-align:center;color:var(--text3);font-size:14px;padding:18px 0">Подій ще немає — натисніть кнопку! 🌟</div>';
+    return;
+  }
+  el.innerHTML=todayEv.slice(0,12).map(ev=>`
+    <div class="tl-item">
+      <div class="tl-icon" style="background:${ev.iconBg||'rgba(255,107,157,.1)'}">${ev.icon}</div>
+      <div class="tl-content">
+        <div class="tl-title">${ev.title}${ev.manual?'<span class="past-badge">📌</span>':''}</div>
+        ${ev.sub?`<div class="tl-sub">${ev.sub}</div>`:''}
+      </div>
+      <div style="display:flex;align-items:center;gap:5px;flex-shrink:0">
+        <div class="tl-time">${ev.time}</div>
+        <div class="tl-edit" onclick="openEditEvent('${ev.id}')">✏️</div>
+      </div>
+    </div>`).join('');
+}
+
+// ══════════════════════════════════════
+// STATS
+// ══════════════════════════════════════
+function renderStats(){
+  const tod=todayStr();
+  const feeds=events.filter(e=>e.type==='feed'&&e.date===tod);
+  const diapers=events.filter(e=>e.type==='diaper'&&e.date===tod);
+  const sleepEv=events.filter(e=>e.type==='sleep'&&e.sub&&e.date===tod);
+  let sleepMs=sleepEv.reduce((s,x)=>{
+    const m=x.sub.match(/(\d+)г\s*(\d*)хв/);
+    if(m)return s+(parseInt(m[1]||0)*3600+parseInt(m[2]||0)*60)*1000;
+    const m2=x.sub.match(/(\d+)хв/);
+    if(m2)return s+parseInt(m2[1])*60000;
+    return s;
+  },0)+(isSleeping?sleepTimer:0);
+
+  const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};
+  set('s-feedCount',feeds.length);
+  set('s-diaperCount',diapers.length);
+  set('s-sleepStr',fmtDur(sleepMs));
+  set('sleepTotalDisp',fmtDur(sleepMs));
+  set('diaperCountH',diapers.length);
+
+  if(feeds.length){
+    const last=feeds[0];
+    const lfc=document.getElementById('lastFeedCard');
+    if(lfc)lfc.style.display='block';
+    set('lastFeedTime',last.time);
+    set('lastFeedInfo',last.sub||last.title);
+    set('nextFeedIn','~'+feedInterval+' год');
+  }
+}
+
+// ══════════════════════════════════════
+// SLEEP
+// ══════════════════════════════════════
+window.toggleSleep=function(){
+  if(!isSleeping){
+    isSleeping=true; sleepStart=Date.now(); sleepTimer=0;
+    sleepInterval=setInterval(()=>{
+      sleepTimer=Date.now()-sleepStart;
+      const el=document.getElementById('mainSleepTimer');
+      if(el)el.textContent=fmtTimer(sleepTimer);
+    },1000);
+    addEvent({type:'sleep',icon:'😴',iconBg:'rgba(162,155,254,.1)',title:'Заснув',sub:''});
+    showToast('😴 Сон розпочато');
+  } else {
+    const dur=sleepTimer;
+    clearInterval(sleepInterval);
+    isSleeping=false; sleepStart=null; sleepTimer=0;
+    addEvent({type:'sleep',icon:'☀️',iconBg:'rgba(85,239,196,.1)',title:'Прокинувся',sub:fmtDur(dur)});
+    showToast('☀️ Прокинувся! Спав: '+fmtDur(dur));
+  }
+  updateSleepUI();
+};
+
+function updateSleepUI(){
+  const btn=document.getElementById('mainSleepBtn');
+  const icon=document.getElementById('mainSleepIcon');
+  const lbl=document.getElementById('mainSleepLabel');
+  const timer=document.getElementById('mainSleepTimer');
+  const qi=document.getElementById('sleepQIcon');
+  const ql=document.getElementById('sleepQLabel');
+  if(isSleeping){
+    if(btn){btn.className='sleep-btn asleep';}
+    if(icon)icon.textContent='☀️';
+    if(lbl)lbl.textContent='Прокинувся';
+    if(timer)timer.style.display='block';
+    if(qi)qi.textContent='☀️';
+    if(ql)ql.textContent='Прокинувся';
+  } else {
+    if(btn)btn.className='sleep-btn awake';
+    if(icon)icon.textContent='😴';
+    if(lbl)lbl.textContent='Натисніть — Заснув';
+    if(timer)timer.style.display='none';
+    if(qi)qi.textContent='😴';
+    if(ql)ql.textContent='Заснув';
+  }
+}
+
+function renderSleepLog(){
+  const el=document.getElementById('sleepLog');
+  if(!el)return;
+  const tod=todayStr();
+  const sessions=events.filter(e=>e.type==='sleep'&&e.sub&&e.date===tod);
+  if(!sessions.length){el.innerHTML='<div class="card" style="text-align:center;color:var(--text3);font-size:14px;padding:18px">Сну ще не зафіксовано 💤</div>';return;}
+  el.innerHTML=sessions.map(s=>`
+    <div class="tl-item">
+      <div class="tl-icon" style="background:rgba(162,155,254,.1)">😴</div>
+      <div class="tl-content">
+        <div class="tl-title">${s.title}</div>
+        <div class="tl-sub">${s.sub}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:5px">
+        <div class="tl-time">${s.time}</div>
+        <div class="tl-edit" onclick="openEditEvent('${s.id}')">✏️</div>
+      </div>
+    </div>`).join('');
+}
+
+// ══════════════════════════════════════
+// FEEDING
+// ══════════════════════════════════════
+window.switchFeedType=function(t,btn){
+  window._feedType=t;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('breastSection').style.display=t==='breast'?'block':'none';
+  document.getElementById('bottleSection').style.display=t==='bottle'?'block':'none';
+};
+
+window.setVol=function(v){document.getElementById('bottleVol').value=v;};
+
+window.toggleBreast=function(side){
+  if(!breastActive[side]){
+    breastActive[side]=true;
+    breastStarts[side]=Date.now()-breastMs[side];
+    breastIntervals[side]=setInterval(()=>{
+      breastMs[side]=Date.now()-breastStarts[side];
+      const el=document.getElementById('timer'+side);
+      if(el)el.textContent=fmtTimer(breastMs[side]);
+      const st=document.getElementById('status'+side);
+      if(st){st.textContent='● Активно';st.style.color='var(--green)';}
+    },500);
+    document.getElementById('btn'+side).classList.add('active');
+  } else {
+    breastActive[side]=false;
+    clearInterval(breastIntervals[side]);
+    document.getElementById('btn'+side).classList.remove('active');
+    const st=document.getElementById('status'+side);
+    if(st){st.textContent='⏸ Пауза';st.style.color='var(--text3)';}
+  }
+};
+
+window.saveFeed=function(){
+  const ft=window._feedType||'breast';
+  if(ft==='bottle'){
+    const vol=document.getElementById('bottleVol').value;
+    if(!vol){showToast('⚠️ Введіть об\'єм');return;}
+    addEvent({type:'feed',icon:'🍼',iconBg:'rgba(255,107,157,.1)',title:'Годування (пляшка)',sub:vol+' мл',ml:parseInt(vol)});
+    document.getElementById('bottleVol').value='';
+    showToast('✅ Годування '+vol+' мл збережено');
+  } else {
+    if(breastMs.L<1000&&breastMs.R<1000){showToast('⚠️ Запустіть таймер');return;}
+    addEvent({type:'feed',icon:'🤱',iconBg:'rgba(255,107,157,.1)',title:'Годування (грудне)',sub:'Л:'+fmtTimer(breastMs.L)+' П:'+fmtTimer(breastMs.R)});
+    ['L','R'].forEach(s=>{
+      breastActive[s]=false;breastMs[s]=0;clearInterval(breastIntervals[s]);
+      const el=document.getElementById('timer'+s);if(el)el.textContent='0:00';
+      document.getElementById('btn'+s).classList.remove('active');
+    });
+    showToast('✅ Годування збережено!');
+  }
+};
+
+function renderFeedHistory(){
+  const el=document.getElementById('feedHistory');
+  if(!el)return;
+  const feeds=events.filter(e=>e.type==='feed').slice(0,15);
+  el.innerHTML=feeds.map(ev=>`
+    <div class="tl-item">
+      <div class="tl-icon" style="background:rgba(255,107,157,.1)">${ev.icon}</div>
+      <div class="tl-content"><div class="tl-title">${ev.title}</div>${ev.sub?`<div class="tl-sub">${ev.sub}</div>`:''}</div>
+      <div style="display:flex;align-items:center;gap:5px">
+        <div class="tl-time">${ev.time}</div>
+        <div class="tl-edit" onclick="openEditEvent('${ev.id}')">✏️</div>
+      </div>
+    </div>`).join('')||'<div style="color:var(--text3);font-size:13px;text-align:center;padding:14px">Ще немає годувань</div>';
+}
+
+// ══════════════════════════════════════
+// QUICK FEED MODAL
+// ══════════════════════════════════════
+window.switchMFeedType=function(t,btn){
+  window._mFeedType=t;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('mBreastSec').style.display=t==='breast'?'block':'none';
+  document.getElementById('mBottleSec').style.display=t==='bottle'?'block':'none';
+};
+window.startMBreast=function(){
+  if(mBreastRunning)return;
+  mBreastRunning=true;mBreastStart=Date.now()-mBreastMs;
+  mBreastInterval=setInterval(()=>{mBreastMs=Date.now()-mBreastStart;const el=document.getElementById('mBreastTimer');if(el)el.textContent=fmtTimer(mBreastMs);},500);
+};
+window.stopMBreast=function(){clearInterval(mBreastInterval);mBreastRunning=false;};
+window.saveModalFeed=function(){
+  const t=window._mFeedType||'breast';
+  if(t==='bottle'){
+    const vol=document.getElementById('mBottleVol').value;
+    if(!vol){showToast('⚠️ Введіть об\'єм');return;}
+    addEvent({type:'feed',icon:'🍼',iconBg:'rgba(255,107,157,.1)',title:'Годування (пляшка)',sub:vol+' мл',ml:parseInt(vol)});
+    document.getElementById('mBottleVol').value='';
+  } else {
+    addEvent({type:'feed',icon:'🤱',iconBg:'rgba(255,107,157,.1)',title:'Годування (грудне)',sub:fmtTimer(mBreastMs)});
+    window.stopMBreast();mBreastMs=0;const el=document.getElementById('mBreastTimer');if(el)el.textContent='0:00';
+  }
+  closeModal('feedModal');showToast('✅ Годування збережено!');
+};
+
+// ══════════════════════════════════════
+// DIAPER
+// ══════════════════════════════════════
+window.selDiaper=function(t,btn){
+  window._diaperType=t;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  const pc=document.getElementById('poopColorSec');
+  if(pc)pc.style.display=(t==='poop'||t==='mixed')?'block':'none';
+};
+window.selPoopColor=function(c,btn){
+  window._poopColor=c;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+window.saveDiaper=function(){
+  const t=window._diaperType||'wet';
+  const labels={wet:'💧 Сеча',poop:'💩 Кал',mixed:'🔄 Змішаний'};
+  const sub=t!=='wet'?'Колір: '+(window._poopColor||'жовтий'):'';
+  addEvent({type:'diaper',icon:'👶',iconBg:'rgba(116,185,255,.1)',title:'Підгузок: '+labels[t],sub});
+  showToast('✅ Підгузок зафіксовано!');
+};
+window.selMDiaper=function(t,btn){
+  window._mDiaperType=t;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+window.saveModalDiaper=function(){
+  const t=window._mDiaperType||'wet';
+  const labels={wet:'💧 Сеча',poop:'💩 Кал',mixed:'🔄 Змішаний'};
+  addEvent({type:'diaper',icon:'👶',iconBg:'rgba(116,185,255,.1)',title:'Підгузок: '+labels[t],sub:''});
+  closeModal('diaperModal');showToast('✅ Підгузок зафіксовано!');
+};
+
+// ══════════════════════════════════════
+// HEALTH
+// ══════════════════════════════════════
+window.saveTemp=function(){
+  const v=parseFloat(document.getElementById('tempIn').value);
+  if(!v||v<35||v>42){showToast('⚠️ Введіть коректну температуру');return;}
+  const color=v<37.3?'var(--green)':v<38?'var(--accent)':'#ff4757';
+  const status=v<37.3?'✓ Норма':v<38?'⚠️ Незначно підвищена':'🔴 Температура!';
+  const td=document.getElementById('tempDisp'),ts=document.getElementById('tempStatus');
+  if(td){td.textContent=v.toFixed(1)+'°';td.style.color=color;}
+  if(ts){ts.textContent=status;ts.style.color=color;}
+  document.getElementById('tempIn').value='';
+  addEvent({type:'temp',icon:'🌡️',iconBg:'rgba(244,162,97,.1)',title:'Температура: '+v.toFixed(1)+'°',sub:v>=38?'⚠️ Підвищена!':'Норма'});
+  showToast(v>=38?'🔴 Зверніться до лікаря!':'✅ '+v.toFixed(1)+'° — Норма');
+};
+window.logBath=function(){
+  addEvent({type:'bath',icon:'🛁',iconBg:'rgba(85,239,196,.1)',title:'Купання',sub:'Виконано'});
+  showToast('🛁 Купання зафіксовано!');
+};
+
+// ══════════════════════════════════════
+// WATER
+// ══════════════════════════════════════
+function initWater(){
+  const cont=document.getElementById('waterDrops');
+  if(!cont)return;
+  cont.innerHTML='';
+  for(let i=0;i<8;i++){
+    const d=document.createElement('div');
+    d.className='drop'+(i<waterCount?' filled':'');
+    d.innerHTML=i<waterCount?'💧':'';
+    const idx=i;
+    d.onclick=()=>{
+      waterCount=waterCount===idx+1?idx:idx+1;
+      saveProfile({waterCount});
+      initWater();
+      const ml=waterCount*250;
+      const wt=document.getElementById('waterTotal'),wb=document.getElementById('waterBar');
+      if(wt)wt.textContent=ml+' мл';
+      if(wb)wb.style.width=Math.min(100,ml/2000*100)+'%';
+      showToast('💧 Вода: '+ml+' мл / 2000 мл');
+    };
+    cont.appendChild(d);
+  }
+  const ml=waterCount*250;
+  const wt=document.getElementById('waterTotal'),wb=document.getElementById('waterBar');
+  if(wt)wt.textContent=ml+' мл';
+  if(wb)wb.style.width=Math.min(100,ml/2000*100)+'%';
+}
+
+// ══════════════════════════════════════
+// EDIT EVENT
+// ══════════════════════════════════════
+window.openEditEvent=function(id){
+  const ev=events.find(e=>e.id===id);
+  if(!ev)return;
+  editingEventId=id;
+  const d=new Date(ev.ts);
+  const dateEl=document.getElementById('editEventDate');
+  const timeEl=document.getElementById('editEventTime');
+  if(dateEl)dateEl.value=d.toISOString().split('T')[0];
+  if(timeEl)timeEl.value=p2(d.getHours())+':'+p2(d.getMinutes());
+
+  const extra=document.getElementById('editExtraFields');
+  if(extra){
+    if(ev.type==='feed'&&ev.sub&&ev.sub.includes('мл')){
+      const ml=ev.sub.match(/(\d+)\s*мл/);
+      extra.innerHTML=`<div class="form-group"><label class="form-label">Об'єм (мл)</label><input type="number" class="form-input" id="editFeedMl" value="${ml?ml[1]:''}" style="font-size:22px;text-align:center;font-weight:800"></div>`;
+    } else if(ev.type==='diaper'){
+      extra.innerHTML=`<div class="form-group"><label class="form-label">Тип</label><div class="seg" style="grid-template-columns:1fr 1fr 1fr" id="editDiaperSeg">
+        <button class="seg-btn ${ev.title.includes('Сеча')?'on':''}" onclick="editSegSel(this,'editDiaperSeg')">💧 Сеча</button>
+        <button class="seg-btn ${ev.title.includes('Кал')?'on':''}" onclick="editSegSel(this,'editDiaperSeg')">💩 Кал</button>
+        <button class="seg-btn ${ev.title.includes('Змішаний')?'on':''}" onclick="editSegSel(this,'editDiaperSeg')">🔄 Змішаний</button>
+      </div></div>`;
+    } else if(ev.type==='temp'){
+      const tm=ev.title.match(/([\d.]+)°/);
+      extra.innerHTML=`<div class="form-group"><label class="form-label">Температура</label><input type="number" class="form-input" id="editTemp" value="${tm?tm[1]:''}" step="0.1" style="font-size:22px;text-align:center;font-weight:800"></div>`;
+    } else {
+      extra.innerHTML=`<div class="form-group"><label class="form-label">Нотатка</label><input type="text" class="form-input" id="editSub" value="${ev.sub||''}"></div>`;
+    }
+  }
+  openModal('editEventModal');
+};
+
+window.editSegSel=function(btn,segId){
+  document.getElementById(segId).querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+
+window.saveEditEvent=async function(){
+  const ev=events.find(e=>e.id===editingEventId);
+  if(!ev){showToast('⚠️ Запис не знайдено');return;}
+  const dateVal=document.getElementById('editEventDate').value;
+  const timeVal=document.getElementById('editEventTime').value;
+  if(!dateVal||!timeVal){showToast('⚠️ Вкажіть дату та час');return;}
+  const [y,mo,day]=dateVal.split('-').map(Number);
+  const [h,m]=timeVal.split(':').map(Number);
+  const newTs=new Date(y,mo-1,day,h,m,0).getTime();
+  const newTime=p2(h)+':'+p2(m);
+  const updates={ts:newTs,time:newTime,date:dateVal};
+
+  if(ev.type==='feed'){
+    const mlEl=document.getElementById('editFeedMl');
+    const subEl=document.getElementById('editSub');
+    if(mlEl&&mlEl.value)updates.sub=mlEl.value+' мл';
+    else if(subEl)updates.sub=subEl.value;
+  } else if(ev.type==='diaper'){
+    const active=document.querySelector('#editDiaperSeg .seg-btn.on');
+    if(active)updates.title='Підгузок: '+active.textContent.trim();
+  } else if(ev.type==='temp'){
+    const t=parseFloat(document.getElementById('editTemp')?.value);
+    if(t>=35&&t<=42){updates.title='Температура: '+t.toFixed(1)+'°';updates.sub=t>=38?'⚠️ Підвищена!':'Норма';}
+  } else {
+    const subEl=document.getElementById('editSub');
+    if(subEl)updates.sub=subEl.value;
+  }
+  await updateEvent(editingEventId,updates);
+  closeModal('editEventModal');
+  showToast('✅ Запис оновлено!');
+};
+
+window.deleteEditEvent=async function(){
+  if(!confirm('Видалити цей запис?'))return;
+  await deleteEvent(editingEventId);
+  closeModal('editEventModal');
+  showToast('🗑️ Видалено');
+};
+
+// ══════════════════════════════════════
+// ADD PAST EVENT
+// ══════════════════════════════════════
+window.openAddPastModal=function(){
+  const now=new Date(),ago=new Date(now-3600000);
+  const dateEl=document.getElementById('pastDate'),timeEl=document.getElementById('pastTime');
+  if(dateEl)dateEl.value=now.toISOString().split('T')[0];
+  if(timeEl)timeEl.value=p2(ago.getHours())+':'+p2(ago.getMinutes());
+  pastEventType='feed';
+  document.querySelectorAll('#pastTypeSeg .seg-btn,#pastTypeSeg2 .seg-btn').forEach(b=>b.classList.remove('on'));
+  const first=document.querySelector('#pastTypeSeg .seg-btn');
+  if(first)first.classList.add('on');
+  renderPastExtraFields();
+  openModal('addPastModal');
+};
+
+window.selPastType=function(type,btn){
+  pastEventType=type;
+  document.querySelectorAll('#pastTypeSeg .seg-btn,#pastTypeSeg2 .seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  renderPastExtraFields();
+};
+
+function renderPastExtraFields(){
+  const el=document.getElementById('pastExtraFields');
+  if(!el)return;
+  if(pastEventType==='feed'){
+    el.innerHTML=`<div class="form-group"><label class="form-label">Тип</label><div class="seg" style="grid-template-columns:1fr 1fr" id="pastFeedTypeSeg"><button class="seg-btn on" onclick="pastSegSel(this,'pastFeedTypeSeg')">🤱 Грудне</button><button class="seg-btn" onclick="pastSegSel(this,'pastFeedTypeSeg')">🍼 Штучне</button></div></div>
+    <div class="form-group"><label class="form-label">Об'єм мл (для штучного)</label><input type="number" class="form-input" id="pastFeedMl" placeholder="120" style="font-size:20px;text-align:center;font-weight:800"><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${[60,90,120,150,180].map(v=>`<button class="btn btn-outline btn-sm" onclick="document.getElementById('pastFeedMl').value=${v}">${v}</button>`).join('')}</div></div>`;
+  } else if(pastEventType==='diaper'){
+    el.innerHTML=`<div class="form-group"><label class="form-label">Тип</label><div class="seg" style="grid-template-columns:1fr 1fr 1fr" id="pastDiaperSeg"><button class="seg-btn on" onclick="pastSegSel(this,'pastDiaperSeg')">💧 Сеча</button><button class="seg-btn" onclick="pastSegSel(this,'pastDiaperSeg')">💩 Кал</button><button class="seg-btn" onclick="pastSegSel(this,'pastDiaperSeg')">🔄 Змішаний</button></div></div>`;
+  } else if(pastEventType==='sleep'){
+    el.innerHTML=`<div class="form-group"><label class="form-label">Прокинувся о</label><input type="time" class="form-input" id="pastSleepEnd" style="font-size:18px;font-weight:800;text-align:center"></div>`;
+  } else if(pastEventType==='temp'){
+    el.innerHTML=`<div class="form-group"><label class="form-label">Температура °C</label><input type="number" class="form-input" id="pastTemp" placeholder="36.6" step="0.1" style="font-size:24px;text-align:center;font-weight:800"></div>`;
+  } else if(pastEventType==='med'){
+    el.innerHTML=`<div class="form-group"><label class="form-label">Назва ліків</label><input type="text" class="form-input" id="pastMedName" placeholder="Вітамін D"></div>`;
+  } else if(pastEventType==='bath'){
+    el.innerHTML=`<div style="padding:10px;background:var(--card2);border-radius:12px;font-size:13px;color:var(--text2)">🛁 Купання буде зафіксовано з вказаним часом</div>`;
+  }
+}
+
+window.pastSegSel=function(btn,segId){
+  document.getElementById(segId).querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+
+window.savePastEvent=async function(){
+  const dateVal=document.getElementById('pastDate').value;
+  const timeVal=document.getElementById('pastTime').value;
+  if(!dateVal||!timeVal){showToast('⚠️ Вкажіть дату та час');return;}
+  const [y,mo,day]=dateVal.split('-').map(Number);
+  const [h,m]=timeVal.split(':').map(Number);
+  const ts=new Date(y,mo-1,day,h,m,0).getTime();
+  const timeStr=p2(h)+':'+p2(m);
+  let ev={ts,time:timeStr,date:dateVal,manual:true};
+
+  if(pastEventType==='feed'){
+    const btn=document.querySelector('#pastFeedTypeSeg .seg-btn.on');
+    const isB=btn&&btn.textContent.includes('Грудне');
+    const ml=document.getElementById('pastFeedMl')?.value;
+    if(!isB&&!ml){showToast('⚠️ Введіть об\'єм');return;}
+    ev={...ev,type:'feed',icon:isB?'🤱':'🍼',iconBg:'rgba(255,107,157,.1)',title:isB?'Годування (грудне)':'Годування (пляшка)',sub:ml?ml+' мл':'',ml:ml?parseInt(ml):0};
+  } else if(pastEventType==='diaper'){
+    const btn=document.querySelector('#pastDiaperSeg .seg-btn.on');
+    const label=btn?btn.textContent.trim():'💧 Сеча';
+    ev={...ev,type:'diaper',icon:'👶',iconBg:'rgba(116,185,255,.1)',title:'Підгузок: '+label,sub:''};
+  } else if(pastEventType==='sleep'){
+    const endVal=document.getElementById('pastSleepEnd')?.value;
+    let dur=0,sub='';
+    if(endVal){const[eh,em]=endVal.split(':').map(Number);dur=Math.max(0,new Date(y,mo-1,day,eh,em,0).getTime()-ts);sub=fmtDur(dur);}
+    ev={...ev,type:'sleep',icon:'😴',iconBg:'rgba(162,155,254,.1)',title:dur>0?'Сон ('+fmtDur(dur)+')':'Заснув',sub};
+  } else if(pastEventType==='temp'){
+    const t=parseFloat(document.getElementById('pastTemp')?.value);
+    if(!t||t<35||t>42){showToast('⚠️ Невірна температура');return;}
+    ev={...ev,type:'temp',icon:'🌡️',iconBg:'rgba(244,162,97,.1)',title:'Температура: '+t.toFixed(1)+'°',sub:t>=38?'⚠️ Підвищена!':'Норма'};
+  } else if(pastEventType==='med'){
+    const name=document.getElementById('pastMedName')?.value.trim();
+    if(!name){showToast('⚠️ Введіть назву');return;}
+    ev={...ev,type:'med',icon:'💊',iconBg:'rgba(244,162,97,.1)',title:'Прийнято: '+name,sub:''};
+  } else if(pastEventType==='bath'){
+    ev={...ev,type:'bath',icon:'🛁',iconBg:'rgba(85,239,196,.1)',title:'Купання',sub:'Виконано'};
+  }
+  await addEvent(ev);
+  closeModal('addPastModal');
+  showToast('✅ Подію збережено з часом '+timeStr+' 📌');
+};
+
+// ══════════════════════════════════════
+// SCHEDULE (Розклад на місяць)
+// ══════════════════════════════════════
+function subscribeSchedule(){
+  if(!currentUser)return;
+  const q=query(collection(db,'schedule'),where('uid','==',currentUser.uid));
+  unsubSchedule=onSnapshot(q,snap=>{
+    schedule=snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderCalendar();
+  });
+}
+
+async function addScheduleItem(item){
+  if(!currentUser)return;
+  await addDoc(collection(db,'schedule'),{...item,uid:currentUser.uid});
+}
+async function updateScheduleItem(id,data){await updateDoc(doc(db,'schedule',id),data);}
+async function deleteScheduleItem(id){await deleteDoc(doc(db,'schedule',id));}
+
+const MONTHS_UK=['Січень','Лютий','Березень','Квітень','Травень','Червень','Липень','Серпень','Вересень','Жовтень','Листопад','Грудень'];
+const DAYS_UK=['Нд','Пн','Вт','Ср','Чт','Пт','Сб'];
+
+window.renderCalendar=function(){
+  const el=document.getElementById('calendarGrid');
+  const titleEl=document.getElementById('calMonthTitle');
+  if(!el||!titleEl)return;
+  titleEl.textContent=MONTHS_UK[currentMonth]+' '+currentYear;
+
+  const firstDay=new Date(currentYear,currentMonth,1).getDay();
+  const daysInMonth=new Date(currentYear,currentMonth+1,0).getDate();
+  const today=new Date();
+  const todayD=today.getDate(),todayM=today.getMonth(),todayY=today.getFullYear();
+
+  let html='';
+  // Day headers
+  DAYS_UK.forEach(d=>{html+=`<div style="text-align:center;font-size:11px;font-weight:700;color:var(--text3);padding:6px 0">${d}</div>`;});
+  // Empty cells
+  for(let i=0;i<firstDay;i++)html+='<div></div>';
+  // Days
+  for(let d=1;d<=daysInMonth;d++){
+    const dateStr=currentYear+'-'+p2(currentMonth+1)+'-'+p2(d);
+    const dayItems=schedule.filter(s=>s.date===dateStr);
+    const isToday=d===todayD&&currentMonth===todayM&&currentYear===todayY;
+    const hasItems=dayItems.length>0;
+    html+=`<div onclick="openDayModal('${dateStr}')" style="min-height:44px;border-radius:10px;padding:4px;cursor:pointer;background:${isToday?'rgba(255,107,157,.15)':'var(--card2)'};border:1.5px solid ${isToday?'var(--pink)':'transparent'};transition:all .2s;position:relative">
+      <div style="font-size:13px;font-weight:${isToday?900:700};color:${isToday?'var(--pink)':'var(--text)'};text-align:center">${d}</div>
+      ${hasItems?`<div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:2px">${dayItems.slice(0,3).map(i=>`<div style="width:6px;height:6px;border-radius:50%;background:${i.color||'var(--blue)'};flex-shrink:0"></div>`).join('')}${dayItems.length>3?`<div style="font-size:8px;color:var(--text3)">+${dayItems.length-3}</div>`:''}</div>`:''}
+    </div>`;
+  }
+  el.innerHTML=html;
+
+  // Render upcoming items list
+  renderScheduleList();
+};
+
+window.prevMonth=function(){
+  currentMonth--;if(currentMonth<0){currentMonth=11;currentYear--;}
+  renderCalendar();
+};
+window.nextMonth=function(){
+  currentMonth++;if(currentMonth>11){currentMonth=0;currentYear++;}
+  renderCalendar();
+};
+
+let selectedDate='';
+window.openDayModal=function(dateStr){
+  selectedDate=dateStr;
+  const d=new Date(dateStr+'T00:00:00');
+  document.getElementById('dayModalTitle').textContent=d.toLocaleDateString('uk-UA',{day:'numeric',month:'long',year:'numeric'});
+  const items=schedule.filter(s=>s.date===dateStr);
+  const listEl=document.getElementById('dayItemsList');
+  listEl.innerHTML=items.length?items.map(item=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--card2);border-radius:12px;margin-bottom:7px;border-left:3px solid ${item.color||'var(--blue)'}">
+      <div>
+        <div style="font-size:14px;font-weight:700">${item.emoji||'📅'} ${item.title}</div>
+        ${item.time?`<div style="font-size:11px;color:var(--text3)">${item.time}</div>`:''}
+        ${item.note?`<div style="font-size:12px;color:var(--text2);margin-top:2px">${item.note}</div>`:''}
+      </div>
+      <div style="display:flex;gap:6px">
+        <button onclick="editScheduleItem('${item.id}')" style="background:transparent;border:none;font-size:16px;cursor:pointer">✏️</button>
+        <button onclick="delScheduleItem('${item.id}')" style="background:transparent;border:none;font-size:16px;cursor:pointer">🗑️</button>
+      </div>
+    </div>`).join(''):'<div style="text-align:center;color:var(--text3);font-size:13px;padding:14px">Немає подій на цей день</div>';
+  openModal('dayModal');
+};
+
+window.openAddScheduleItem=function(){
+  editingScheduleId=null;
+  ['schedItemTitle','schedItemTime','schedItemNote'].forEach(id=>{const e=document.getElementById(id);if(e)e.value='';});
+  document.getElementById('schedItemDate').value=selectedDate;
+  document.getElementById('schedModalTitle').textContent='➕ Нова подія';
+  closeModal('dayModal');
+  openModal('schedItemModal');
+};
+
+window.editScheduleItem=function(id){
+  editingScheduleId=id;
+  const item=schedule.find(s=>s.id===id);
+  if(!item)return;
+  document.getElementById('schedItemTitle').value=item.title||'';
+  document.getElementById('schedItemTime').value=item.time||'';
+  document.getElementById('schedItemNote').value=item.note||'';
+  document.getElementById('schedItemDate').value=item.date||selectedDate;
+  document.getElementById('schedModalTitle').textContent='✏️ Редагувати подію';
+  closeModal('dayModal');
+  openModal('schedItemModal');
+};
+
+window.delScheduleItem=async function(id){
+  if(!confirm('Видалити подію?'))return;
+  await deleteScheduleItem(id);
+  closeModal('dayModal');
+  showToast('🗑️ Видалено');
+};
+
+window.saveScheduleItem=async function(){
+  const title=document.getElementById('schedItemTitle').value.trim();
+  const time=document.getElementById('schedItemTime').value;
+  const note=document.getElementById('schedItemNote').value.trim();
+  const date=document.getElementById('schedItemDate').value||selectedDate;
+  const emoji=window._schedEmoji||'📅';
+  const color=window._schedColor||'var(--blue)';
+  if(!title){showToast('⚠️ Введіть назву');return;}
+  if(editingScheduleId){
+    await updateScheduleItem(editingScheduleId,{title,time,note,date,emoji,color});
+    showToast('✅ Оновлено!');
+  } else {
+    await addScheduleItem({title,time,note,date,emoji,color});
+    showToast('✅ Подію додано!');
+  }
+  closeModal('schedItemModal');
+};
+
+window.selSchedEmoji=function(e,btn){
+  window._schedEmoji=e;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+window.selSchedColor=function(c,btn){
+  window._schedColor=c;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+
+function renderScheduleList(){
+  const el=document.getElementById('upcomingList');
+  if(!el)return;
+  const today=new Date();today.setHours(0,0,0,0);
+  const upcoming=schedule.filter(s=>new Date(s.date+'T00:00:00')>=today).sort((a,b)=>a.date.localeCompare(b.date)).slice(0,10);
+  el.innerHTML=upcoming.length?upcoming.map(item=>{
+    const d=new Date(item.date+'T00:00:00');
+    const dateStr=d.toLocaleDateString('uk-UA',{day:'numeric',month:'short'});
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:11px 14px;background:var(--card2);border-radius:14px;margin-bottom:8px;border-left:3px solid ${item.color||'var(--blue)'}">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="font-size:22px">${item.emoji||'📅'}</div>
+        <div><div style="font-size:13px;font-weight:700">${item.title}</div><div style="font-size:11px;color:var(--text3)">${dateStr}${item.time?' о '+item.time:''}</div></div>
+      </div>
+      <div style="display:flex;gap:5px">
+        <div class="tl-edit" onclick="editScheduleItem('${item.id}')">✏️</div>
+        <div class="tl-edit" onclick="delScheduleItem('${item.id}')">🗑️</div>
+      </div>
+    </div>`;
+  }).join(''):'<div style="text-align:center;color:var(--text3);font-size:13px;padding:14px">Немає запланованих подій</div>';
+}
+
+// ══════════════════════════════════════
+// DIARY
+// ══════════════════════════════════════
+window.selEmoji=function(e,btn){
+  window._diaryEmoji=e;
+  btn.parentElement.querySelectorAll('.seg-btn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+};
+window.saveDiary=async function(){
+  const text=document.getElementById('diaryText').value.trim();
+  if(!text){showToast('⚠️ Напишіть щось');return;}
+  const now=new Date();
+  await addEvent({type:'note',icon:window._diaryEmoji||'📝',iconBg:'rgba(255,234,167,.1)',title:'Щоденник',sub:text.substring(0,80),fullText:text,date:todayStr()});
+  document.getElementById('diaryText').value='';
+  closeModal('diaryModal');
+  showToast('✅ Запис збережено!');
+};
+
+// ══════════════════════════════════════
+// DELETE ALL DATA
+// ══════════════════════════════════════
+window.confirmReset=async function(){
+  if(!confirm('Видалити ВСІ ваші дані? Цю дію не можна скасувати!'))return;
+  if(!currentUser)return;
+  showToast('🗑️ Видалення...');
+  const q=query(collection(db,'events'),where('uid','==',currentUser.uid));
+  const snap=await getDocs(q);
+  const batch=[];
+  snap.docs.forEach(d=>batch.push(deleteDoc(doc(db,'events',d.id))));
+  await Promise.all(batch);
+  await setDoc(doc(db,'profiles',currentUser.uid),{});
+  showToast('✅ Дані видалено');
+};
+
+// Service Worker
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('/sw.js').catch(()=>{});
+  });
+}
+
+</script>
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#0f0e17;--bg2:#1a1829;--card:#1e1c2e;--card2:#252340;
+  --pink:#ff6b9d;--blue:#74b9ff;--blue2:#a29bfe;
+  --green:#55efc4;--green2:#00b894;--accent:#f4a261;--accent2:#e76f51;
+  --purple:#a29bfe;--text:#f0eeff;--text2:#b8b5cc;--text3:#7b7a8f;
+  --border:rgba(255,255,255,0.08);--radius:20px;--radius2:14px;
+  --font:'Nunito',sans-serif;--font2:'Quicksand',sans-serif;
+}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20% 10%,rgba(162,155,254,.07) 0%,transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(255,107,157,.05) 0%,transparent 50%);pointer-events:none;z-index:0}
+.app{max-width:430px;margin:0 auto;min-height:100vh;position:relative;z-index:1}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 8px;position:sticky;top:0;z-index:100;background:linear-gradient(180deg,var(--bg) 60%,transparent)}
+.app-title{font-family:var(--font2);font-size:20px;font-weight:700;background:linear-gradient(135deg,var(--pink),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.clock{font-size:14px;font-weight:800;color:var(--text2);font-variant-numeric:tabular-nums}
+.child-pill{background:var(--card);border:1px solid var(--border);border-radius:30px;padding:5px 12px;font-size:13px;font-weight:700;color:var(--text);cursor:pointer;display:flex;align-items:center;gap:5px}
+.navbar{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:430px;background:rgba(15,14,23,.97);backdrop-filter:blur(20px);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:8px 4px 20px;z-index:200}
+.nav-item{display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;padding:5px 8px;border-radius:12px;transition:all .2s;min-width:44px}
+.nav-item.active{background:rgba(255,107,157,.12)}
+.nav-icon{font-size:20px}
+.nav-item.active .nav-icon{transform:scale(1.1)}
+.nav-label{font-size:9px;font-weight:700;color:var(--text3)}
+.nav-item.active .nav-label{color:var(--pink)}
+.screen{display:none;padding:0 16px 110px;animation:fadeIn .25s ease}
+.screen.active{display:block}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:12px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.card-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--text3);margin-bottom:10px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:14px 20px;border-radius:var(--radius2);font-family:var(--font);font-size:15px;font-weight:700;cursor:pointer;border:none;transition:transform .15s;width:100%}
+.btn:active{transform:scale(.96)}
+.btn-pink{background:linear-gradient(135deg,var(--pink),var(--accent2));color:#fff}
+.btn-blue{background:linear-gradient(135deg,var(--blue2),var(--blue));color:#fff}
+.btn-green{background:linear-gradient(135deg,var(--green2),var(--green));color:#0a2e1f}
+.btn-accent{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+.btn-outline{background:transparent;border:1.5px solid var(--border);color:var(--text2);padding:11px 16px;font-size:14px}
+.btn-danger{background:rgba(255,71,87,.15);border:1.5px solid rgba(255,71,87,.3);color:#ff4757;font-size:13px;padding:9px 14px}
+.btn-sm{padding:9px 14px;font-size:13px;width:auto}
+.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.qbtn{background:var(--card);border:1.5px solid var(--border);border-radius:var(--radius);padding:16px 8px;display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer;transition:all .2s}
+.qbtn:active{transform:scale(.93)}
+.qbtn-icon{font-size:28px}
+.qbtn-label{font-size:11px;font-weight:700;color:var(--text2);text-align:center}
+.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius2);padding:12px 8px;text-align:center}
+.stat-val{font-size:20px;font-weight:900;font-variant-numeric:tabular-nums}
+.stat-lbl{font-size:10px;font-weight:700;color:var(--text3);margin-top:2px}
+.tl-item{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--card2);border-radius:var(--radius2);border:1px solid var(--border);margin-bottom:7px}
+.tl-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.tl-content{flex:1}
+.tl-title{font-size:13px;font-weight:700}
+.tl-sub{font-size:11px;color:var(--text3);margin-top:1px}
+.tl-time{font-size:11px;font-weight:700;color:var(--text3);flex-shrink:0}
+.tl-edit{width:28px;height:28px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:13px;cursor:pointer;flex-shrink:0}
+.past-badge{display:inline-flex;align-items:center;padding:1px 6px;border-radius:8px;font-size:10px;background:rgba(244,162,97,.12);color:var(--accent);margin-left:5px}
+.form-group{margin-bottom:12px}
+.form-label{font-size:12px;font-weight:700;color:var(--text2);margin-bottom:5px;display:block}
+.form-input,.form-textarea{width:100%;background:var(--card2);border:1.5px solid var(--border);border-radius:var(--radius2);padding:12px 14px;font-family:var(--font);font-size:15px;color:var(--text);outline:none;transition:border-color .2s}
+.form-input:focus,.form-textarea:focus{border-color:var(--pink)}
+.form-textarea{resize:none;min-height:75px}
+.seg{display:grid;background:var(--card2);border-radius:var(--radius2);padding:4px;margin-bottom:12px}
+.seg-btn{padding:9px 4px;border-radius:10px;font-family:var(--font);font-size:12px;font-weight:700;color:var(--text3);border:none;background:transparent;cursor:pointer;transition:all .2s;text-align:center}
+.seg-btn.on{background:var(--card);color:var(--text);box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.toggle{width:48px;height:28px;background:var(--card2);border-radius:14px;position:relative;cursor:pointer;border:1.5px solid var(--border);transition:background .2s;flex-shrink:0}
+.toggle.on{background:var(--pink);border-color:var(--pink)}
+.toggle::after{content:'';position:absolute;width:20px;height:20px;background:#fff;border-radius:50%;top:2px;left:2px;transition:left .2s;box-shadow:0 2px 4px rgba(0,0,0,.3)}
+.toggle.on::after{left:22px}
+.sleep-btn{width:100%;height:120px;border-radius:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;font-family:var(--font);border:none;cursor:pointer;transition:all .3s;margin-bottom:14px}
+.sleep-btn.asleep{background:linear-gradient(135deg,#1a3a2a,var(--green2));box-shadow:0 8px 30px rgba(0,184,148,.3);animation:pulseGlow 2.5s infinite}
+.sleep-btn.awake{background:linear-gradient(135deg,#2d2563,var(--purple));box-shadow:0 8px 30px rgba(162,155,254,.25)}
+@keyframes pulseGlow{0%{box-shadow:0 8px 30px rgba(0,184,148,.3)}50%{box-shadow:0 8px 50px rgba(0,184,148,.6)}100%{box-shadow:0 8px 30px rgba(0,184,148,.3)}}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+.info-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius2);padding:14px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(5px)}
+.modal-bg.open{display:flex}
+.modal{background:var(--bg2);border-radius:28px 28px 0 0;width:100%;max-width:430px;max-height:88vh;overflow-y:auto;padding:20px 20px 44px;animation:slideUp .3s ease}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal-handle{width:40px;height:4px;background:var(--border);border-radius:2px;margin:0 auto 18px}
+.modal-title{font-size:20px;font-weight:800;margin-bottom:16px}
+.toast{position:fixed;top:74px;left:50%;transform:translateX(-50%) translateY(-8px);background:var(--card);border:1px solid var(--border);border-radius:14px;padding:11px 18px;font-size:14px;font-weight:600;z-index:500;opacity:0;transition:all .3s;white-space:nowrap;box-shadow:0 8px 32px rgba(0,0,0,.4);pointer-events:none;max-width:90vw}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.breast-btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.breast-btn{padding:16px 10px;border-radius:var(--radius);display:flex;flex-direction:column;align-items:center;gap:5px;cursor:pointer;border:2px solid var(--border);background:var(--card);font-family:var(--font);transition:all .2s}
+.breast-btn.active{border-color:var(--pink);background:rgba(255,107,157,.1)}
+.breast-timer{font-size:20px;font-weight:900;font-variant-numeric:tabular-nums;color:var(--pink)}
+.water-drops{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.drop{width:36px;height:44px;border-radius:50% 50% 50% 50% / 60% 60% 40% 40%;background:transparent;border:2px solid var(--blue);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .2s}
+.drop.filled{background:linear-gradient(180deg,var(--blue2),var(--blue))}
+.drop:active{transform:scale(.88)}
+.progress{height:8px;background:var(--card2);border-radius:4px;overflow:hidden;margin-top:8px}
+.progress-fill{height:100%;border-radius:4px;transition:width .5s}
+.sep{height:1px;background:var(--border);margin:14px 0}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.sec-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.sec-title{font-size:17px;font-weight:800}
+.see-all{font-size:12px;font-weight:700;color:var(--pink);cursor:pointer}
+.vaccine-item{display:flex;align-items:center;gap:12px;padding:11px 14px;background:var(--card2);border-radius:var(--radius2);margin-bottom:8px;border-left:3px solid var(--purple)}
+.diary-entry{padding:14px;background:var(--card2);border-radius:var(--radius2);margin-bottom:10px;border:1px solid var(--border)}
+
+/* AUTH SCREEN */
+#authScreen{position:fixed;inset:0;background:var(--bg);z-index:999;display:flex;align-items:center;justify-content:center;padding:20px}
+.auth-box{width:100%;max-width:400px;background:var(--card);border-radius:24px;padding:30px 24px;border:1px solid var(--border)}
+.auth-title{font-family:var(--font2);font-size:28px;font-weight:700;text-align:center;background:linear-gradient(135deg,var(--pink),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
+.auth-sub{font-size:14px;color:var(--text3);text-align:center;margin-bottom:24px}
+.auth-error{color:#ff4757;font-size:13px;text-align:center;margin-top:10px;min-height:18px}
+#appScreen{display:none}
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+</style>
+</head>
+<body>
+
+<!-- ══ AUTH SCREEN ══ -->
+<div id="authScreen">
+  <div class="auth-box">
+    <div class="auth-title">🌙 Мама + Малюк</div>
+    <div class="auth-sub">Ваш особистий помічник</div>
+
+    <div class="seg" style="grid-template-columns:1fr 1fr;margin-bottom:20px">
+      <button class="seg-btn on" id="tabLogin" onclick="switchAuthTab('login')">Увійти</button>
+      <button class="seg-btn" id="tabReg" onclick="switchAuthTab('reg')">Реєстрація</button>
+    </div>
+
+    <!-- LOGIN -->
+    <div id="loginForm">
+      <div class="form-group">
+        <label class="form-label">Email</label>
+        <input type="email" class="form-input" id="loginEmail" placeholder="mama@gmail.com" autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Пароль</label>
+        <input type="password" class="form-input" id="loginPass" placeholder="Ваш пароль" autocomplete="current-password">
+      </div>
+    </div>
+
+    <!-- REGISTER -->
+    <div id="regForm" style="display:none">
+      <div class="form-group">
+        <label class="form-label">Ваше ім'я</label>
+        <input type="text" class="form-input" id="regName" placeholder="наприклад, Оля">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Email</label>
+        <input type="email" class="form-input" id="regEmail" placeholder="mama@gmail.com" autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Пароль (мін. 6 символів)</label>
+        <input type="password" class="form-input" id="regPass" placeholder="Придумайте пароль" autocomplete="new-password">
+      </div>
+    </div>
+
+    <button class="btn btn-pink" id="authSubmitBtn" onclick="document.getElementById('loginForm').style.display!=='none'?doLogin():doRegister()">Увійти / Зареєструватись</button>
+    <div class="auth-error" id="authError"></div>
+  </div>
+</div>
+
+<!-- ══ APP SCREEN ══ -->
+<div id="appScreen">
+<div class="app">
+
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <div class="app-title">🌙 Мама + Малюк</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div class="clock" id="clock">00:00</div>
+      <div class="child-pill" onclick="openModal('settingsModal')">
+        <span id="topChildName">Налаштування</span> ⚙️
+      </div>
+    </div>
+  </div>
+
+  <!-- HOME -->
+  <div class="screen active" id="s-home">
+    <div style="display:flex;align-items:center;gap:14px;padding:16px;background:linear-gradient(135deg,rgba(255,107,157,.1),rgba(162,155,254,.07));border-radius:var(--radius);border:1px solid rgba(255,107,157,.2);margin-bottom:12px">
+      <div id="childAvatar" style="width:54px;height:54px;border-radius:50%;background:linear-gradient(135deg,var(--pink),var(--purple));display:flex;align-items:center;justify-content:center;font-size:26px;flex-shrink:0">🍼</div>
+      <div style="flex:1">
+        <div style="font-size:18px;font-weight:800" id="childNameDisplay">Ваш малюк</div>
+        <div style="font-size:12px;color:var(--text2);margin-top:2px">Народився: <span id="birthDisplay">—</span></div>
+        <div style="font-size:12px;color:var(--pink);font-weight:700;margin-top:3px" id="childAge"></div>
+      </div>
+      <div style="font-size:12px;color:var(--text3);text-align:right">
+        <div id="userNameDisplay" style="font-weight:700;color:var(--text2)"></div>
+        <div onclick="doLogout()" style="color:#ff4757;font-weight:700;cursor:pointer;margin-top:4px">Вийти</div>
+      </div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-val" style="color:var(--pink)" id="s-feedCount">0</div><div class="stat-lbl">Годувань</div></div>
+      <div class="stat-card"><div class="stat-val" style="color:var(--blue)" id="s-sleepStr">0хв</div><div class="stat-lbl">Сон</div></div>
+      <div class="stat-card"><div class="stat-val" style="color:var(--green)" id="s-diaperCount">0</div><div class="stat-lbl">Підгузків</div></div>
+    </div>
+
+    <div class="quick-grid">
+      <div class="qbtn" style="border-color:rgba(255,107,157,.3)" onclick="openModal('feedModal')"><div class="qbtn-icon">🍼</div><div class="qbtn-label">Годування</div></div>
+      <div class="qbtn" style="border-color:rgba(116,185,255,.3)" onclick="openModal('diaperModal')"><div class="qbtn-icon">👶</div><div class="qbtn-label">Підгузок</div></div>
+      <div class="qbtn" style="border-color:rgba(162,155,254,.3)" onclick="toggleSleep()" id="sleepQBtn"><div class="qbtn-icon" id="sleepQIcon">😴</div><div class="qbtn-label" id="sleepQLabel">Заснув</div></div>
+    </div>
+
+    <div class="sec-hdr">
+      <div class="sec-title">Сьогодні</div>
+      <div class="see-all" onclick="openAddPastModal()">+ Минулу подію</div>
+    </div>
+    <div class="card"><div id="timeline"><div style="text-align:center;color:var(--text3);font-size:14px;padding:18px 0">Подій ще немає 🌟</div></div></div>
+
+    <div class="card" id="lastFeedCard" style="display:none">
+      <div class="card-title">Останнє годування</div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div><div style="font-size:22px;font-weight:800;color:var(--pink)" id="lastFeedTime">—</div><div style="font-size:12px;color:var(--text3)" id="lastFeedInfo">—</div></div>
+        <div style="text-align:right"><div style="font-size:12px;color:var(--text3)">Наступне через:</div><div style="font-size:18px;font-weight:800;color:var(--accent)" id="nextFeedIn">~3 год</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FEED -->
+  <div class="screen" id="s-feed">
+    <div style="font-size:20px;font-weight:800;margin-bottom:14px">🍼 Годування</div>
+    <div class="card">
+      <div class="card-title">Тип годування</div>
+      <div class="seg" style="grid-template-columns:1fr 1fr">
+        <button class="seg-btn on" onclick="switchFeedType('breast',this)">🤱 Грудне</button>
+        <button class="seg-btn" onclick="switchFeedType('bottle',this)">🍼 Штучне</button>
+      </div>
+      <div id="breastSection">
+        <div class="breast-btns">
+          <button class="breast-btn" id="btnL" onclick="toggleBreast('L')"><div style="font-size:24px">⬅️</div><div style="font-size:12px;font-weight:700;color:var(--text2)">Ліва</div><div class="breast-timer" id="timerL">0:00</div><div style="font-size:10px;font-weight:700;color:var(--text3)" id="statusL">○ Стоп</div></button>
+          <button class="breast-btn" id="btnR" onclick="toggleBreast('R')"><div style="font-size:24px">➡️</div><div style="font-size:12px;font-weight:700;color:var(--text2)">Права</div><div class="breast-timer" id="timerR">0:00</div><div style="font-size:10px;font-weight:700;color:var(--text3)" id="statusR">○ Стоп</div></button>
+        </div>
+      </div>
+      <div id="bottleSection" style="display:none">
+        <input type="number" class="form-input" id="bottleVol" placeholder="Об'єм (мл)" style="font-size:26px;text-align:center;font-weight:800;margin-bottom:10px">
+        <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px">
+          <button class="btn btn-outline btn-sm" onclick="setVol(60)">60</button><button class="btn btn-outline btn-sm" onclick="setVol(90)">90</button><button class="btn btn-outline btn-sm" onclick="setVol(120)">120</button><button class="btn btn-outline btn-sm" onclick="setVol(150)">150</button><button class="btn btn-outline btn-sm" onclick="setVol(180)">180</button>
+        </div>
+      </div>
+      <button class="btn btn-pink" onclick="saveFeed()">✅ Зберегти годування</button>
+    </div>
+    <div class="sec-hdr"><div class="sec-title">Історія</div></div>
+    <div id="feedHistory"></div>
+  </div>
+
+  <!-- SLEEP -->
+  <div class="screen" id="s-sleep">
+    <div style="font-size:20px;font-weight:800;margin-bottom:14px">😴 Сон</div>
+    <button class="sleep-btn awake" id="mainSleepBtn" onclick="toggleSleep()">
+      <div style="font-size:40px" id="mainSleepIcon">😴</div>
+      <div style="font-size:17px;font-weight:800;color:#fff" id="mainSleepLabel">Натисніть — Заснув</div>
+      <div style="font-size:14px;color:rgba(255,255,255,.75);display:none;font-variant-numeric:tabular-nums" id="mainSleepTimer">0:00</div>
+    </button>
+    <div class="grid2">
+      <div class="info-card"><div style="font-size:20px">🌙</div><div style="font-size:17px;font-weight:800;color:var(--blue);margin-top:4px" id="sleepTotalDisp">0хв</div><div style="font-size:10px;font-weight:600;color:var(--text3);margin-top:2px">Всього сьогодні</div></div>
+      <div class="info-card"><div style="font-size:20px">💤</div><div style="font-size:17px;font-weight:800;color:var(--purple);margin-top:4px" id="sleepAvg">—</div><div style="font-size:10px;font-weight:600;color:var(--text3);margin-top:2px">Останній сон</div></div>
+    </div>
+    <div class="sec-hdr"><div class="sec-title">Журнал</div></div>
+    <div id="sleepLog"></div>
+  </div>
+
+  <!-- HEALTH -->
+  <div class="screen" id="s-health">
+    <div style="font-size:20px;font-weight:800;margin-bottom:14px">🏥 Здоров'я</div>
+    <div class="card">
+      <div class="card-title">🌡️ Температура</div>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+        <div><div style="font-size:36px;font-weight:900;color:var(--green)" id="tempDisp">—</div><div style="font-size:12px;font-weight:700;color:var(--green)" id="tempStatus">Введіть температуру</div></div>
+        <input type="number" class="form-input" id="tempIn" placeholder="36.6" step="0.1" style="flex:1;font-size:22px;text-align:center;font-weight:800">
+        <button class="btn btn-green btn-sm" onclick="saveTemp()" style="width:auto">✓</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">👶 Підгузки сьогодні: <span style="color:var(--blue)" id="diaperCountH">0</span></div>
+      <div class="seg" style="grid-template-columns:1fr 1fr 1fr" id="diaperTypeSeg">
+        <button class="seg-btn on" onclick="selDiaper('wet',this)">💧 Сеча</button>
+        <button class="seg-btn" onclick="selDiaper('poop',this)">💩 Кал</button>
+        <button class="seg-btn" onclick="selDiaper('mixed',this)">🔄 Змішаний</button>
+      </div>
+      <div id="poopColorSec" style="display:none;margin-bottom:12px">
+        <div class="form-label">Колір</div>
+        <div class="seg" style="grid-template-columns:repeat(4,1fr)">
+          <button class="seg-btn on" onclick="selPoopColor('yellow',this)">🟡 Жовт</button>
+          <button class="seg-btn" onclick="selPoopColor('green',this)">🟢 Зелен</button>
+          <button class="seg-btn" onclick="selPoopColor('brown',this)">🟤 Корич</button>
+          <button class="seg-btn" onclick="selPoopColor('other',this)">⚪ Інший</button>
+        </div>
+      </div>
+      <button class="btn btn-blue" onclick="saveDiaper()">✅ Зафіксувати зміну</button>
+    </div>
+    <div class="card">
+      <div class="card-title">🛁 Купання</div>
+      <button class="btn btn-outline" onclick="logBath()">🛁 Зафіксувати купання</button>
+    </div>
+  </div>
+
+  <!-- SCHEDULE -->
+  <div class="screen" id="s-schedule">
+    <div class="sec-hdr" style="padding-top:4px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <button onclick="prevMonth()" style="background:var(--card);border:1px solid var(--border);border-radius:10px;width:34px;height:34px;font-size:16px;cursor:pointer;color:var(--text)">←</button>
+        <div style="font-size:16px;font-weight:800" id="calMonthTitle">Місяць</div>
+        <button onclick="nextMonth()" style="background:var(--card);border:1px solid var(--border);border-radius:10px;width:34px;height:34px;font-size:16px;cursor:pointer;color:var(--text)">→</button>
+      </div>
+      <button class="btn btn-pink btn-sm" onclick="selectedDate=todayStr();openAddScheduleItem()">+ Подія</button>
+    </div>
+    <div class="card">
+      <div class="cal-grid" id="calendarGrid"></div>
+    </div>
+    <div class="sec-hdr"><div class="sec-title">Найближчі події</div></div>
+    <div id="upcomingList"></div>
+  </div>
+
+  <!-- DIARY -->
+  <div class="screen" id="s-diary">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding-top:4px">
+      <div style="font-size:20px;font-weight:800">📚 Розвиток</div>
+      <button class="btn btn-accent btn-sm" onclick="openModal('diaryModal')">+ Запис</button>
+    </div>
+    <div style="font-size:17px;font-weight:800;margin-bottom:10px">💉 Вакцинація</div>
+    <div class="vaccine-item" style="border-left-color:var(--green)"><div style="font-size:11px;font-weight:700;color:var(--green);min-width:68px">При народж.</div><div><div style="font-size:13px;font-weight:700">✅ БЦЖ, Гепатит B (1)</div><div style="font-size:11px;color:var(--text3)">Виконано</div></div></div>
+    <div class="vaccine-item" style="border-left-color:var(--accent)"><div style="font-size:11px;font-weight:700;color:var(--accent);min-width:68px">1 місяць</div><div><div style="font-size:13px;font-weight:700">⏳ Гепатит B (2)</div><div style="font-size:11px;color:var(--text3)">Планово</div></div></div>
+    <div class="vaccine-item"><div style="font-size:11px;font-weight:700;color:var(--text3);min-width:68px">2 місяці</div><div><div style="font-size:13px;font-weight:700">📅 АКДП, Поліо, Hib</div><div style="font-size:11px;color:var(--text3)">Планово</div></div></div>
+    <div class="vaccine-item"><div style="font-size:11px;font-weight:700;color:var(--text3);min-width:68px">4 місяці</div><div><div style="font-size:13px;font-weight:700">📅 АКДП (2), Поліо (2)</div><div style="font-size:11px;color:var(--text3)">Планово</div></div></div>
+    <div class="vaccine-item"><div style="font-size:11px;font-weight:700;color:var(--text3);min-width:68px">12 місяців</div><div><div style="font-size:13px;font-weight:700">📅 КПК, Вітряна віспа</div><div style="font-size:11px;color:var(--text3)">Планово</div></div></div>
+    <div class="sep"></div>
+    <div style="font-size:17px;font-weight:800;margin-bottom:10px">📝 Щоденник</div>
+    <div id="diaryList"></div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div class="screen" id="s-settings">
+    <div style="font-size:20px;font-weight:800;margin-bottom:14px;padding-top:4px">⚙️ Налаштування</div>
+    <div class="card">
+      <div class="card-title">👶 Профіль дитини</div>
+      <div class="form-group"><label class="form-label">Ім'я дитини</label><input type="text" class="form-input" id="settingChildName" placeholder="наприклад, Соня"></div>
+      <div class="form-group"><label class="form-label">Дата народження</label><input type="date" class="form-input" id="settingBirthDate"></div>
+      <div class="form-group"><label class="form-label">Аватар</label>
+        <div class="seg" style="grid-template-columns:repeat(5,1fr)">
+          <button class="seg-btn on" onclick="selAvatar('🍼',this)">🍼</button>
+          <button class="seg-btn" onclick="selAvatar('👶',this)">👶</button>
+          <button class="seg-btn" onclick="selAvatar('🌸',this)">🌸</button>
+          <button class="seg-btn" onclick="selAvatar('⭐',this)">⭐</button>
+          <button class="seg-btn" onclick="selAvatar('🐣',this)">🐣</button>
+        </div>
+      </div>
+      <button class="btn btn-pink" onclick="saveSettings()">💾 Зберегти</button>
+    </div>
+    <div class="card">
+      <div class="card-title">💧 Вода мами</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-size:14px;font-weight:700">Сьогодні</div>
+        <div style="font-size:17px;font-weight:800;color:var(--blue)" id="waterTotal">0 мл</div>
+      </div>
+      <div class="progress"><div class="progress-fill" id="waterBar" style="width:0%;background:linear-gradient(90deg,var(--blue2),var(--blue))"></div></div>
+      <div class="water-drops" id="waterDrops"></div>
+      <div style="font-size:11px;color:var(--text3);margin-top:5px">Кожна крапля = 250 мл • Мета: 2000 мл</div>
+    </div>
+    <div class="card">
+      <div class="card-title">🗑️ Небезпечна зона</div>
+      <button class="btn btn-danger" onclick="confirmReset()">Видалити всі мої дані</button>
+    </div>
+    <div style="text-align:center;margin-top:16px">
+      <button onclick="doLogout()" style="background:transparent;border:1.5px solid rgba(255,71,87,.3);color:#ff4757;padding:10px 24px;border-radius:12px;font-family:var(--font);font-size:14px;font-weight:700;cursor:pointer">🚪 Вийти з акаунту</button>
+    </div>
+  </div>
+
+</div><!-- end .app -->
+
+<!-- NAVBAR -->
+<div class="navbar">
+  <div class="nav-item active" id="nav-home" onclick="goTo('home')"><div class="nav-icon">🏠</div><div class="nav-label">Головна</div></div>
+  <div class="nav-item" id="nav-feed" onclick="goTo('feed')"><div class="nav-icon">🍼</div><div class="nav-label">Годування</div></div>
+  <div class="nav-item" id="nav-sleep" onclick="goTo('sleep')"><div class="nav-icon">😴</div><div class="nav-label">Сон</div></div>
+  <div class="nav-item" id="nav-health" onclick="goTo('health')"><div class="nav-icon">🏥</div><div class="nav-label">Здоров'я</div></div>
+  <div class="nav-item" id="nav-schedule" onclick="goTo('schedule')"><div class="nav-icon">📅</div><div class="nav-label">Розклад</div></div>
+  <div class="nav-item" id="nav-diary" onclick="goTo('diary')"><div class="nav-icon">📚</div><div class="nav-label">Розвиток</div></div>
+  <div class="nav-item" id="nav-settings" onclick="goTo('settings')"><div class="nav-icon">⚙️</div><div class="nav-label">Профіль</div></div>
+</div>
+</div><!-- end #appScreen -->
+
+<!-- MODALS -->
+<div class="modal-bg" id="feedModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">🍼 Годування</div>
+  <div class="seg" style="grid-template-columns:1fr 1fr"><button class="seg-btn on" onclick="switchMFeedType('breast',this)">🤱 Грудне</button><button class="seg-btn" onclick="switchMFeedType('bottle',this)">🍼 Штучне</button></div>
+  <div id="mBreastSec"><div style="text-align:center;padding:10px 0 14px"><div style="font-size:46px;font-weight:900;font-variant-numeric:tabular-nums;margin-bottom:12px" id="mBreastTimer">0:00</div><div style="display:flex;gap:10px;justify-content:center"><button class="btn btn-pink btn-sm" onclick="startMBreast()">▶ Старт</button><button class="btn btn-outline btn-sm" onclick="stopMBreast()">⏹ Стоп</button></div></div></div>
+  <div id="mBottleSec" style="display:none"><input type="number" class="form-input" id="mBottleVol" placeholder="Об'єм (мл)" style="font-size:24px;text-align:center;font-weight:800;margin-bottom:10px"><div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px"><button class="btn btn-outline btn-sm" onclick="document.getElementById('mBottleVol').value=80">80</button><button class="btn btn-outline btn-sm" onclick="document.getElementById('mBottleVol').value=100">100</button><button class="btn btn-outline btn-sm" onclick="document.getElementById('mBottleVol').value=120">120</button><button class="btn btn-outline btn-sm" onclick="document.getElementById('mBottleVol').value=150">150</button></div></div>
+  <button class="btn btn-pink" onclick="saveModalFeed()">✅ Зберегти</button>
+  <button class="btn btn-outline" onclick="closeModal('feedModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<div class="modal-bg" id="diaperModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">👶 Підгузок</div>
+  <div class="seg" style="grid-template-columns:1fr 1fr 1fr"><button class="seg-btn on" onclick="selMDiaper('wet',this)">💧 Сеча</button><button class="seg-btn" onclick="selMDiaper('poop',this)">💩 Кал</button><button class="seg-btn" onclick="selMDiaper('mixed',this)">🔄 Змішаний</button></div>
+  <button class="btn btn-blue" onclick="saveModalDiaper()">✅ Зафіксувати</button>
+  <button class="btn btn-outline" onclick="closeModal('diaperModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<div class="modal-bg" id="editEventModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">✏️ Редагувати запис</div>
+  <div class="form-group"><label class="form-label">Час</label><input type="time" class="form-input" id="editEventTime" style="font-size:22px;font-weight:800;text-align:center"></div>
+  <div class="form-group"><label class="form-label">Дата</label><input type="date" class="form-input" id="editEventDate"></div>
+  <div id="editExtraFields"></div>
+  <button class="btn btn-pink" onclick="saveEditEvent()">💾 Зберегти зміни</button>
+  <button class="btn btn-danger" onclick="deleteEditEvent()" style="margin-top:8px">🗑️ Видалити запис</button>
+  <button class="btn btn-outline" onclick="closeModal('editEventModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<div class="modal-bg" id="addPastModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">⏰ Минула подія</div>
+  <div class="form-group"><label class="form-label">Тип події</label>
+    <div class="seg" style="grid-template-columns:repeat(3,1fr)" id="pastTypeSeg">
+      <button class="seg-btn on" onclick="selPastType('feed',this)">🍼 Годування</button>
+      <button class="seg-btn" onclick="selPastType('diaper',this)">👶 Підгузок</button>
+      <button class="seg-btn" onclick="selPastType('sleep',this)">😴 Сон</button>
+    </div>
+    <div class="seg" style="grid-template-columns:repeat(3,1fr)" id="pastTypeSeg2">
+      <button class="seg-btn" onclick="selPastType('bath',this)">🛁 Купання</button>
+      <button class="seg-btn" onclick="selPastType('med',this)">💊 Ліки</button>
+      <button class="seg-btn" onclick="selPastType('temp',this)">🌡️ Темпер.</button>
+    </div>
+  </div>
+  <div class="form-group"><label class="form-label">Дата та час</label>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <input type="date" class="form-input" id="pastDate">
+      <input type="time" class="form-input" id="pastTime" style="font-size:18px;font-weight:800;text-align:center">
+    </div>
+  </div>
+  <div id="pastExtraFields"></div>
+  <button class="btn btn-pink" onclick="savePastEvent()">✅ Зберегти</button>
+  <button class="btn btn-outline" onclick="closeModal('addPastModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<div class="modal-bg" id="settingsModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">⚙️ Профіль дитини</div>
+  <div class="form-group"><label class="form-label">Ім'я дитини</label><input type="text" class="form-input" id="settingChildName" placeholder="наприклад, Соня"></div>
+  <div class="form-group"><label class="form-label">Дата народження</label><input type="date" class="form-input" id="settingBirthDate"></div>
+  <div class="form-group"><label class="form-label">Аватар</label>
+    <div class="seg" style="grid-template-columns:repeat(5,1fr)">
+      <button class="seg-btn on" onclick="selAvatar('🍼',this)">🍼</button>
+      <button class="seg-btn" onclick="selAvatar('👶',this)">👶</button>
+      <button class="seg-btn" onclick="selAvatar('🌸',this)">🌸</button>
+      <button class="seg-btn" onclick="selAvatar('⭐',this)">⭐</button>
+      <button class="seg-btn" onclick="selAvatar('🐣',this)">🐣</button>
+    </div>
+  </div>
+  <button class="btn btn-pink" onclick="saveSettings()">💾 Зберегти</button>
+  <button class="btn btn-outline" onclick="closeModal('settingsModal')" style="margin-top:8px">Закрити</button>
+</div></div>
+
+<div class="modal-bg" id="diaryModal"><div class="modal"><div class="modal-handle"></div><div class="modal-title">📝 Новий запис</div>
+  <div class="form-group"><label class="form-label">Що трапилось? 🌟</label><textarea class="form-textarea" id="diaryText" placeholder="Сьогодні вперше..."></textarea></div>
+  <div class="form-group"><label class="form-label">Емоція</label>
+    <div class="seg" style="grid-template-columns:repeat(4,1fr)">
+      <button class="seg-btn on" onclick="selEmoji('😍',this)">😍</button>
+      <button class="seg-btn" onclick="selEmoji('🎉',this)">🎉</button>
+      <button class="seg-btn" onclick="selEmoji('💪',this)">💪</button>
+      <button class="seg-btn" onclick="selEmoji('🥰',this)">🥰</button>
+    </div>
+  </div>
+  <button class="btn btn-accent" onclick="saveDiary()">✅ Зберегти</button>
+  <button class="btn btn-outline" onclick="closeModal('diaryModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<!-- DAY MODAL -->
+<div class="modal-bg" id="dayModal"><div class="modal"><div class="modal-handle"></div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="modal-title" id="dayModalTitle" style="margin-bottom:0">День</div>
+    <button class="btn btn-pink btn-sm" onclick="openAddScheduleItem()">+ Додати</button>
+  </div>
+  <div id="dayItemsList"></div>
+  <button class="btn btn-outline" onclick="closeModal('dayModal')" style="margin-top:8px">Закрити</button>
+</div></div>
+
+<!-- SCHEDULE ITEM MODAL -->
+<div class="modal-bg" id="schedItemModal"><div class="modal"><div class="modal-handle"></div>
+  <div class="modal-title" id="schedModalTitle">➕ Нова подія</div>
+  <div class="form-group"><label class="form-label">Назва події</label><input type="text" class="form-input" id="schedItemTitle" placeholder="наприклад, Щеплення, Педіатр..."></div>
+  <div class="form-group"><label class="form-label">Дата</label><input type="date" class="form-input" id="schedItemDate"></div>
+  <div class="form-group"><label class="form-label">Час (необов'язково)</label><input type="time" class="form-input" id="schedItemTime"></div>
+  <div class="form-group"><label class="form-label">Нотатка</label><input type="text" class="form-input" id="schedItemNote" placeholder="Додаткова інформація..."></div>
+  <div class="form-group"><label class="form-label">Іконка</label>
+    <div class="seg" style="grid-template-columns:repeat(6,1fr)">
+      <button class="seg-btn on" onclick="selSchedEmoji('📅',this)">📅</button>
+      <button class="seg-btn" onclick="selSchedEmoji('💉',this)">💉</button>
+      <button class="seg-btn" onclick="selSchedEmoji('🏥',this)">🏥</button>
+      <button class="seg-btn" onclick="selSchedEmoji('💊',this)">💊</button>
+      <button class="seg-btn" onclick="selSchedEmoji('🛁',this)">🛁</button>
+      <button class="seg-btn" onclick="selSchedEmoji('⭐',this)">⭐</button>
+    </div>
+  </div>
+  <div class="form-group"><label class="form-label">Колір</label>
+    <div class="seg" style="grid-template-columns:repeat(5,1fr)">
+      <button class="seg-btn on" onclick="selSchedColor('var(--blue)',this)" style="color:var(--blue)">●</button>
+      <button class="seg-btn" onclick="selSchedColor('var(--pink)',this)" style="color:var(--pink)">●</button>
+      <button class="seg-btn" onclick="selSchedColor('var(--green)',this)" style="color:var(--green)">●</button>
+      <button class="seg-btn" onclick="selSchedColor('var(--accent)',this)" style="color:var(--accent)">●</button>
+      <button class="seg-btn" onclick="selSchedColor('var(--purple)',this)" style="color:var(--purple)">●</button>
+    </div>
+  </div>
+  <button class="btn btn-pink" onclick="saveScheduleItem()">✅ Зберегти</button>
+  <button class="btn btn-outline" onclick="closeModal('schedItemModal');openModal('dayModal')" style="margin-top:8px">Скасувати</button>
+</div></div>
+
+<div class="toast" id="toast"></div>
+
+</body>
+</html>
